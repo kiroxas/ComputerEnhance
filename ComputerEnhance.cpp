@@ -2,6 +2,7 @@ struct RegisterCode
 {
     u8 code;
     u8 w;
+    u8 isSegmentRegister;
 };
 
 inline bool isAccumulator(RegisterCode& reg)
@@ -93,36 +94,116 @@ internal RegisterCode getRegisterCode(String registerName)
         code.code = 0b111;
         code.w    = 1;
     }
+    else if(stringsAreEqual(registerName, fromC("ES")) || stringsAreEqual(registerName, fromC("es")))
+    {
+        code.code = 0b00;
+        code.w    = 0;
+        code.isSegmentRegister = 1;
+    }
+    else if(stringsAreEqual(registerName, fromC("CS")) || stringsAreEqual(registerName, fromC("cs")))
+    {
+        code.code = 0b01;
+        code.w    = 0;
+        code.isSegmentRegister = 1;
+    }
+    else if(stringsAreEqual(registerName, fromC("SS")) || stringsAreEqual(registerName, fromC("ss")))
+    {
+        code.code = 0b10;
+        code.w    = 0;
+        code.isSegmentRegister = 1;
+    }
+    else if(stringsAreEqual(registerName, fromC("DS")) || stringsAreEqual(registerName, fromC("ds")))
+    {
+        code.code = 0b11;
+        code.w    = 0;
+        code.isSegmentRegister = 1;
+    }
     return code;
 }
 
 globalVariable char* regsW0[] =
 {
-    "AL", "CL", "DL", "BL", "AH", "CH","DH", "BH"
+    "AL", "CL", "DL", "BL", "AH", "CH","DH", "BH",
 };
 
 globalVariable char* regsW1[] =
 {
-    "AX", "CX", "DX", "BX", "SP", "BP","SI", "DI"
+    "AX", "CX", "DX", "BX", "SP", "BP","SI", "DI",
 };
+
+struct Registers
+{
+    u16 registers[8];
+    u16 segmentRegisters[4];
+};
+
+struct RegisterIndex
+{
+    u8 index;
+    u8 part; // @Note 0 all, 1 low, 2 high
+};  
+
+inline RegisterIndex getRegisterIndex(u8 reg, u8 w)
+{
+    RegisterIndex result = {};
+    if(w)
+    {
+        switch(reg)
+        {
+            case 3 : result.index = 1; break;
+            case 1 : result.index = 2; break;
+            case 2 : result.index = 3; break;
+            default : result.index = reg; break;
+        }
+    }
+    else
+    {
+        switch(reg)
+        {
+            case 0 : result.index = 0; result.part = 1; break;
+            case 3 : result.index = 1; result.part = 1; break;
+            case 1 : result.index = 2; result.part = 1; break;
+            case 2 : result.index = 3; result.part = 1; break;
+            case 4 : result.index = 0; result.part = 2; break;
+            case 5 : result.index = 2; result.part = 2; break;
+            case 6 : result.index = 3; result.part = 2; break;
+            case 7 : result.index = 1; result.part = 2; break;
+        }
+    }
+
+    return result;
+}
 
 inline void getRegisterName(u8 reg, u8 w, OutputBuffer& out)
 {
     formatStringAdvance(out, w ? regsW1[reg] : regsW0[reg]);
 }
 
-#define registerToRegisterCmpOpcode  0b001110
-#define registerToRegisterSubOpcode  0b001010
-#define registerToRegisterAddOpcode  0b000000
-#define registerToRegisterMovOpcode  0b100010
-#define immediateToRegisterMovOpcode 0b1011
-#define immediateToMemoryMovOpcode   0b1100011
-#define immediateToMemoryAddOpcode   0b100000
-#define memoryToAccumulatorMovOpcode 0b1010000
-#define accumulatorToMemoryMovOpcode 0b1010001
-#define immediateToAccumulatorAddOpCode 0b0000010    
-#define immediateToAccumulatorSubOpCode 0b0010110    
-#define immediateToAccumulatorCmpOpCode 0b0011110    
+globalVariable char* regsSegment[] =
+{
+    "ES", "CS", "SS", "DS"
+};
+
+inline void getSegmentRegisterName(u8 reg, OutputBuffer& out)
+{
+    Assert(reg < 4);
+    formatStringAdvance(out, regsSegment[reg]);
+}
+
+#define registerToRegisterCmpOpcode        0b001110
+#define registerToRegisterSubOpcode        0b001010
+#define registerToRegisterAddOpcode        0b000000
+#define registerToRegisterMovOpcode        0b100010
+#define immediateToRegisterMovOpcode       0b1011
+#define immediateToMemoryMovOpcode         0b1100011
+#define immediateToMemoryAddOpcode         0b100000
+#define memoryToAccumulatorMovOpcode       0b1010000
+#define accumulatorToMemoryMovOpcode       0b1010001
+#define immediateToAccumulatorAddOpCode    0b0000010    
+#define immediateToAccumulatorSubOpCode    0b0010110    
+#define immediateToAccumulatorCmpOpCode    0b0011110    
+#define registerToSegmentRegisterMovOpcode 0b10001110    
+#define segmentRegisterToRegisterMovOpcode 0b10001100    
 
 enum ASMType
 {
@@ -646,7 +727,7 @@ internal u8 getAddSignedBit(ASMAtomic& r0, ASMAtomic& r1)
 
 internal void computerEnhanceUpdate(GameMemory& memory)
 {
-    String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0041_add_sub_cmp_jnz.asm"), memory.frame);
+    String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0045_challenge_register_movs.asm"), memory.frame);
     Tokenizer tokenizer = tokenize(asmContent);
     
     u8 instructions[512];
@@ -672,6 +753,8 @@ internal void computerEnhanceUpdate(GameMemory& memory)
         u8*    byte;
         String name;
     };
+
+    Registers registers = {};
 
     LabelQueueItem labelQueue[64];
     u32 queueCount = 0;
@@ -878,20 +961,52 @@ internal void computerEnhanceUpdate(GameMemory& memory)
                             {
                                 case ASMType_Register:
                                 {
+                                    bool segmentEncoding = false;
                                     u8 opCode;
                                     switch(type)
                                     {
-                                        case OpCodeType_Mov: opCode = registerToRegisterMovOpcode; break;
+                                        case OpCodeType_Mov: 
+                                        {
+                                            if(r0.reg.isSegmentRegister == 1)
+                                            {
+                                                opCode = registerToSegmentRegisterMovOpcode;
+                                                segmentEncoding = true;
+
+                                                ASMAtomic tmp = r0;
+                                                r0 = r1;
+                                                r1 = tmp;
+                                                d = 0;
+                                            }
+                                            else if (r1.reg.isSegmentRegister == 1)
+                                            {
+                                                opCode = segmentRegisterToRegisterMovOpcode; 
+                                                segmentEncoding = true;
+                                            }
+                                            else
+                                            {                                                                 
+                                                opCode = registerToRegisterMovOpcode; 
+                                            }
+                                            break;
+                                        }
                                         case OpCodeType_Add: opCode = registerToRegisterAddOpcode; break;
                                         case OpCodeType_Sub: opCode = registerToRegisterSubOpcode; break;
                                         case OpCodeType_Cmp: opCode = registerToRegisterCmpOpcode; break;
                                     }
-                                    u8 mod    = 0b11;
-                                    Assert(r0.reg.w == r1.reg.w);
-                                    current[0] = (opCode << 2) | (r1.reg.w & 1);
-                                    current[1] = (mod << 6) | (r1.reg.code << 3) | (r0.reg.code);
 
-                                    current += 2;
+                                    u8 mod    = 0b11;
+                                    if(segmentEncoding)
+                                    {
+                                        current[0] = opCode;
+                                        current[1] = (mod << 6) | (r1.reg.code << 3) | (r0.reg.code);
+                                        current += 2;
+                                    }
+                                    else
+                                    {
+                                        Assert(r0.reg.w == r1.reg.w);
+                                        current[0] = (opCode << 2) | (r1.reg.w & 1);
+                                        current[1] = (mod << 6) | (r1.reg.code << 3) | (r0.reg.code);
+                                        current += 2;
+                                    }
                                     break;
                                 }
                                 case ASMType_Immediate:
@@ -1149,8 +1264,74 @@ internal void computerEnhanceUpdate(GameMemory& memory)
     {
         if (((*current) >> 2) == registerToRegisterMovOpcode)
         {
+            u8 d   = ((*current) >> 1) & 1;
+            u8 w   = (*current) & 1;
+            u8 mod = *(current + 1) >> 6;
+            u8 reg = (*(current + 1) >> 3) & 0b111;
+            u8 rm  = *(current + 1) & 0b111;
+
+            // @Note SIMULATION 
+            {
+                RegisterIndex destIndex = d ? getRegisterIndex(reg, w) : getRegisterIndex(rm, w);
+                RegisterIndex srcIndex  = d ? getRegisterIndex(rm, w) : getRegisterIndex(reg, w);
+                u16* src = registers.registers + srcIndex.index;
+                u16* dst = registers.registers + destIndex.index;
+                if(w)
+                {
+                    *dst = *src;
+                }
+                else
+                {
+                    *((u8*)dst + ((destIndex.part == 2) ? 1 : 0)) = *((u8*)src + ((srcIndex.part == 2) ? 1 : 0));
+                }
+            }
+
             formatStringAdvance(out, "mov ");
             outputRegisterToRegister(current, out);
+        }
+        else if(*current == registerToSegmentRegisterMovOpcode)
+        {
+            u8 mod = *(current + 1) >> 6;
+            u8 reg = (*(current + 1) >> 3) & 0b111;
+            u8 rm  = *(current + 1) & 0b111;
+            u8 w   = 1;
+
+            // @Note SIMULATION
+            {
+                RegisterIndex srcIndex = getRegisterIndex(rm, w);
+                u16* src = registers.registers + srcIndex.index;
+                Assert(reg < 4);
+                u16* dst = registers.segmentRegisters + reg;
+                *dst = *src;
+            }
+
+            formatStringAdvance(out, "mov ");
+            getSegmentRegisterName(reg, out);
+            formatStringAdvance(out, ", ");
+            getRegisterName(rm, w, out);
+            current += 2;
+        }
+        else if(*current == segmentRegisterToRegisterMovOpcode)
+        {
+            u8 mod = *(current + 1) >> 6;
+            u8 reg = (*(current + 1) >> 3) & 0b111;
+            u8 rm  = *(current + 1) & 0b111;
+            u8 w = 1;
+
+            // @Note SIMULATION
+            {
+                u16* dst = registers.registers + getRegisterIndex(rm, w).index;
+                Assert(reg < 4);
+                u16* src = registers.segmentRegisters + reg;
+                *dst = *src;
+            }
+
+            formatStringAdvance(out, "mov ");
+            getRegisterName(rm, w, out);
+            formatStringAdvance(out, ", ");
+            getSegmentRegisterName(reg, out);
+            
+            current += 2;
         }
         else if (((*current) >> 2) == registerToRegisterAddOpcode)
         {
@@ -1177,7 +1358,7 @@ internal void computerEnhanceUpdate(GameMemory& memory)
             getRegisterName(reg, w, out);
             formatStringAdvance(out, ", ");
 
-            u32 data = 0;
+            u16 data = 0;
             if(w)
             {
                 data = *((u16*)current);
@@ -1188,7 +1369,21 @@ internal void computerEnhanceUpdate(GameMemory& memory)
                 data = (u16)*((u8*)current);
                 current += 1;
             }
-            formatStringAdvance(out, "%d", data);
+            formatStringAdvance(out, "%d", (u32)data);
+
+            // @Note SIMULATION
+            {
+                RegisterIndex index = getRegisterIndex(reg, w);
+                u16* dst = registers.registers + index.index;
+                if(w)
+                {
+                    *dst = data;
+                }
+                else
+                {
+                    *((u8*)dst + ((index.part == 2) ? 1 : 0)) = (u8)data;
+                }
+            }
         }
         else if((*current >> 1) == immediateToMemoryMovOpcode)
         {
