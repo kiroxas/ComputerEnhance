@@ -131,10 +131,25 @@ globalVariable char* regsW1[] =
     "AX", "CX", "DX", "BX", "SP", "BP","SI", "DI",
 };
 
+#define CF_FLAG 0b0000000000000001
+#define PF_FLAG 0b0000000000000100
+#define AF_FLAG 0b0000000000010000
+#define ZF_FLAG 0b0000000001000000
+#define SF_FLAG 0b0000000010000000
+#define TF_FLAG 0b0000000100000000
+#define IF_FLAG 0b0000001000000000
+#define DF_FLAG 0b0000010000000000
+#define OF_FLAG 0b0000100000000000
+
+#define HIGHEST_16_BIT 0b1000000000000000
+#define HIGHEST_8_BIT 0b10000000
+
 struct Registers
 {
     u16 registers[8];
     u16 segmentRegisters[4];
+    u16 ip;
+    u16 flags;
 };
 
 struct RegisterIndex
@@ -478,13 +493,16 @@ enum OpCodeType
     OpCodeType_Jump,
 };
 
-internal void immediateToMemory(u8*& current, OutputBuffer& out, bool valueIsSigned = false)
+internal u32 immediateToMemory(u8* current, OutputBuffer& out, bool valueIsSigned = false)
 {
+    u32 inc = 0;
     u8 w = (*current) & 1;
     ++current;
+    ++inc;
     u8 mod = *current >> 6;
     u8 rm  = *current & 0b111;
     ++current;
+    ++inc;
 
     switch(mod)
     {
@@ -494,6 +512,7 @@ internal void immediateToMemory(u8*& current, OutputBuffer& out, bool valueIsSig
             {
                 s32 value = *(s16*)current;
                 current += 2;
+                inc += 2;
                 outputEffectiveAddress(out, rm, value, true);
             }
             else
@@ -507,6 +526,7 @@ internal void immediateToMemory(u8*& current, OutputBuffer& out, bool valueIsSig
         {
             s32 value = *(s8*)current;
             ++current;
+            ++inc;
             outputEffectiveAddress(out, rm, value);
             break;
         }
@@ -514,6 +534,7 @@ internal void immediateToMemory(u8*& current, OutputBuffer& out, bool valueIsSig
         {
             s32 value = *(s16*)current;
             current += 2;
+            inc += 2;
             outputEffectiveAddress(out, rm, value);
             break;
         }
@@ -533,7 +554,7 @@ internal void immediateToMemory(u8*& current, OutputBuffer& out, bool valueIsSig
         }
         else
         {
-             formatStringAdvance(out, "byte ");
+            formatStringAdvance(out, "byte ");
         }
     }
 
@@ -541,30 +562,34 @@ internal void immediateToMemory(u8*& current, OutputBuffer& out, bool valueIsSig
     {
         data = valueIsSigned ? (s32)*((s16*)current) : (s32)*((u16*)current);
         current += 2;
+        inc += 2;
     }
     else
     {
         data = valueIsSigned ? (s32)*((s8*)current) : (s32)*((u8*)current);
         current += 1;
+        inc += 1;
     }
     
     formatStringAdvance(out, "%i", data);
+    return inc;
 }
 
-internal void outputRegisterToRegister(u8*& current, OutputBuffer& out)
+internal u32 outputRegisterToRegister(u8* current, OutputBuffer& out)
 {
+    u32 inc = 0;
     u8 d   = ((*current) >> 1) & 1;
     u8 w   = (*current) & 1;
     u8 mod = *(current + 1) >> 6;
     u8 reg = (*(current + 1) >> 3) & 0b111;
     u8 rm  = *(current + 1) & 0b111;
-    current +=2;
+    inc +=2;
     s32 value = 0;
     switch(mod)
     {
         case 0b00:
         {
-            value = *(u16*)current;
+            value = *(u16*)(current + 2);
             if(d)
             {
                 getRegisterName(reg, w, out);
@@ -581,8 +606,8 @@ internal void outputRegisterToRegister(u8*& current, OutputBuffer& out)
         }
         case 0b01:
         {
-            value = *(s8*)current;
-            ++current;
+            value = *(s8*)(current + 2);
+            ++inc;
             if(d)
             {
                 getRegisterName(reg, w, out);
@@ -599,8 +624,8 @@ internal void outputRegisterToRegister(u8*& current, OutputBuffer& out)
         }
         case 0b10:
         {
-            value = *(s16*)current;
-            current += 2;
+            value = *(s16*)(current + 2);
+            inc += 2;
             if(d)
             {
                 getRegisterName(reg, w, out);
@@ -623,6 +648,8 @@ internal void outputRegisterToRegister(u8*& current, OutputBuffer& out)
             break;
         }
     }
+
+    return inc;
 }
 
 internal void encodeImmediateToRegisterOrMemory(u8 opCode, u8*& current, u8 mod, u8 w, u8 rm, u16 value, u16 memoryValue, bool neg, u8 writeWide, u8 middlePart = 0b000)
@@ -725,10 +752,107 @@ internal u8 getAddSignedBit(ASMAtomic& r0, ASMAtomic& r1)
     return s;
 }
 
-internal void computerEnhanceUpdate(GameMemory& memory)
+internal void updateFlags16(u32 val, Registers& registers)
 {
-    String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0045_challenge_register_movs.asm"), memory.frame);
+    if(val == 0)
+    {
+        registers.flags |= ZF_FLAG;
+    }
+    else
+    {
+        registers.flags &= ~ZF_FLAG;
+    }
+    
+    if(val & HIGHEST_16_BIT)
+    {
+        registers.flags |= SF_FLAG;
+    }
+    else
+    {
+        registers.flags &= ~SF_FLAG;
+    }
+
+    if(val & (HIGHEST_16_BIT >> 1))
+    {
+        registers.flags |= CF_FLAG;
+    }
+    else
+    {
+        registers.flags &= ~CF_FLAG;
+    }
+
+    u32 value = *(u8*)&val;
+    u8 cnt = Intrinsics::popcnt(value);
+    if((cnt % 2) == 0)
+    {
+        registers.flags |= PF_FLAG;
+    }
+    else
+    {
+        registers.flags &= ~PF_FLAG;
+    }
+
+    if(val > S16Max)
+    {
+        registers.flags |= OF_FLAG;
+    }
+    else
+    {
+        registers.flags &= ~OF_FLAG;
+    }
+}
+
+internal void updateFlags8(u32 val, Registers& registers)
+{
+    if(val == 0)
+    {
+        registers.flags |= ZF_FLAG;
+    }
+    else
+    {
+        registers.flags &= ~ZF_FLAG;
+    }
+    if(val & HIGHEST_8_BIT)
+    {
+        registers.flags |= SF_FLAG;
+    }
+    else
+    {
+        registers.flags &= ~SF_FLAG;
+    }
+    u8 cnt = Intrinsics::popcnt(val);
+    if((cnt % 2) == 0)
+    {
+        registers.flags |= PF_FLAG;
+    }
+    else
+    {
+        registers.flags &= ~PF_FLAG;
+    }
+
+    if(val > S8Max)
+    {
+        registers.flags |= OF_FLAG;
+    }
+    else
+    {
+        registers.flags &= ~OF_FLAG;
+    }
+}
+
+internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& assets, GameMemory& memory)
+{
+    // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0045_challenge_register_movs.asm"), memory.frame);
+    // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0047_challenge_flags.asm"), memory.frame);
+    String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0050_challenge_jumps.asm"), memory.frame);
     Tokenizer tokenizer = tokenize(asmContent);
+
+    RenderGroup group = initOrthographic(&commands, &assets);
+    pushClear(group, Color_black);
+    Rect2 screen      = getWholeScreenInPixels(group);
+
+    FontInstance font   = pushPercentFont(group, Font_FiraMono, 0.025f);
+    // pushLeftTextAtConstrained(group, font, asmContent, screen, 0);
     
     u8 instructions[512];
     u8* current = instructions;
@@ -768,6 +892,10 @@ internal void computerEnhanceUpdate(GameMemory& memory)
             case Token_Semicolon:
             {
                 getNextTokenOfType(tokenizer, Token_EOL);
+                break;
+            }
+            case Token_EndOfStream:
+            {
                 break;
             }
             case Token_Identifier:
@@ -1203,8 +1331,8 @@ internal void computerEnhanceUpdate(GameMemory& memory)
 
                         if(label)
                         {
-                            u32 curAddress = (u32)(current - instructions);
-                            s32 jump = label->address - (curAddress + 1);
+                            u32 curAddress = (u32)(current - 1 - instructions);
+                            s32 jump = label->address - curAddress;
                             *(s8*)current = (s8)jump;
                         }
                         else
@@ -1242,8 +1370,8 @@ internal void computerEnhanceUpdate(GameMemory& memory)
         }
 
         Assert(label);
-        u32 curAddress = (u32)(item->byte - instructions);
-        s32 jump = label->address - (curAddress + 1);
+        u32 curAddress = (u32)(item->byte - 1 - instructions);
+        s32 jump = label->address - curAddress;
         *(s8*)item->byte = (s8)jump;
     }
 
@@ -1253,15 +1381,14 @@ internal void computerEnhanceUpdate(GameMemory& memory)
     appendChunk(stream, instructions, (u32)(current - instructions));
 
     PlatformWriteResult res = platformApi.writeStream(stream, fromC("../data/ASM/binaryASM"), memory.frame);
-    platformApi.closeFile(res.handle);
 
     String full;
     full.size = (u32)kilobytes(2);
     full.content = PushArray(memory.frame, u8, full.size);
     OutputBuffer out = makeOutputBuffer(full);
-    current = instructions;
     for(;;)
     {
+        u8* current = instructions + registers.ip;
         if (((*current) >> 2) == registerToRegisterMovOpcode)
         {
             u8 d   = ((*current) >> 1) & 1;
@@ -1287,7 +1414,7 @@ internal void computerEnhanceUpdate(GameMemory& memory)
             }
 
             formatStringAdvance(out, "mov ");
-            outputRegisterToRegister(current, out);
+            registers.ip += outputRegisterToRegister(current, out);
         }
         else if(*current == registerToSegmentRegisterMovOpcode)
         {
@@ -1309,7 +1436,7 @@ internal void computerEnhanceUpdate(GameMemory& memory)
             getSegmentRegisterName(reg, out);
             formatStringAdvance(out, ", ");
             getRegisterName(rm, w, out);
-            current += 2;
+            registers.ip += 2;
         }
         else if(*current == segmentRegisterToRegisterMovOpcode)
         {
@@ -1331,29 +1458,113 @@ internal void computerEnhanceUpdate(GameMemory& memory)
             formatStringAdvance(out, ", ");
             getSegmentRegisterName(reg, out);
             
-            current += 2;
+            registers.ip += 2;
         }
         else if (((*current) >> 2) == registerToRegisterAddOpcode)
         {
+            // @Note SIMULATION 
+            {
+                u8 d   = ((*current) >> 1) & 1;
+                u8 w   = (*current) & 1;
+                u8 mod = *(current + 1) >> 6;
+                u8 reg = (*(current + 1) >> 3) & 0b111;
+                u8 rm  = *(current + 1) & 0b111;
+
+                RegisterIndex destIndex = d ? getRegisterIndex(reg, w) : getRegisterIndex(rm, w);
+                RegisterIndex srcIndex  = d ? getRegisterIndex(rm, w) : getRegisterIndex(reg, w);
+                u16* src = registers.registers + srcIndex.index;
+                u16* dst = registers.registers + destIndex.index;
+                
+                if(w)
+                {
+                    *dst += *src;
+                    updateFlags16(*dst, registers);
+                }
+                else
+                {
+                    u8* ds = (u8*)dst + ((destIndex.part == 2) ? 1 : 0);
+                    u8* s = (u8*)src + ((srcIndex.part == 2) ? 1 : 0);
+                    *ds += *s;
+
+                    updateFlags8(*ds, registers);
+                }
+            }    
+
             formatStringAdvance(out, "add ");
-            outputRegisterToRegister(current, out);
+            registers.ip += outputRegisterToRegister(current, out);
         }
         else if (((*current) >> 2) == registerToRegisterSubOpcode)
         {
+            // @Note SIMULATION 
+            {
+                u8 d   = ((*current) >> 1) & 1;
+                u8 w   = (*current) & 1;
+                u8 mod = *(current + 1) >> 6;
+                u8 reg = (*(current + 1) >> 3) & 0b111;
+                u8 rm  = *(current + 1) & 0b111;
+
+                RegisterIndex destIndex = d ? getRegisterIndex(reg, w) : getRegisterIndex(rm, w);
+                RegisterIndex srcIndex  = d ? getRegisterIndex(rm, w) : getRegisterIndex(reg, w);
+                u16* src = registers.registers + srcIndex.index;
+                u16* dst = registers.registers + destIndex.index;
+                
+                if(w)
+                {
+                    *dst -= *src;
+                    updateFlags16(*dst, registers);
+                }
+                else
+                {
+                    u8* ds = (u8*)dst + ((destIndex.part == 2) ? 1 : 0);
+                    u8* s = (u8*)src + ((srcIndex.part == 2) ? 1 : 0);
+                    *ds -= *s;
+
+                    updateFlags8(*ds, registers);
+                }
+            }    
+
             formatStringAdvance(out, "sub ");
-            outputRegisterToRegister(current, out);
+            registers.ip += outputRegisterToRegister(current, out);
         }
         else if (((*current) >> 2) == registerToRegisterCmpOpcode)
         {
+            // @Note SIMULATION 
+            {
+                u8 d   = ((*current) >> 1) & 1;
+                u8 w   = (*current) & 1;
+                u8 mod = *(current + 1) >> 6;
+                u8 reg = (*(current + 1) >> 3) & 0b111;
+                u8 rm  = *(current + 1) & 0b111;
+
+                RegisterIndex destIndex = d ? getRegisterIndex(reg, w) : getRegisterIndex(rm, w);
+                RegisterIndex srcIndex  = d ? getRegisterIndex(rm, w) : getRegisterIndex(reg, w);
+                u16* src = registers.registers + srcIndex.index;
+                u16* dst = registers.registers + destIndex.index;
+                
+                if(w)
+                {
+                    u16 val = *dst - *src;
+                    updateFlags16(val, registers);
+                }
+                else
+                {
+                    u8* ds = (u8*)dst + ((destIndex.part == 2) ? 1 : 0);
+                    u8* s = (u8*)src + ((srcIndex.part == 2) ? 1 : 0);
+                    u8 d = *ds - *s;
+
+                    updateFlags8(d, registers);
+                }
+            }    
+
             formatStringAdvance(out, "cmp ");
-            outputRegisterToRegister(current, out);
+            registers.ip += outputRegisterToRegister(current, out);
         }
         else if( ((*current) >> 4) == immediateToRegisterMovOpcode)
         {
             formatStringAdvance(out, "mov ");
             u8 w = ((*current) >> 3) & 1;
             u8 reg = (*current) & 0b111;
-            ++current;
+            registers.ip += 1;
 
             getRegisterName(reg, w, out);
             formatStringAdvance(out, ", ");
@@ -1361,13 +1572,13 @@ internal void computerEnhanceUpdate(GameMemory& memory)
             u16 data = 0;
             if(w)
             {
-                data = *((u16*)current);
-                current += 2;
+                data = *((u16*)(current + 1));
+                registers.ip += 2;
             }
             else
             {
-                data = (u16)*((u8*)current);
-                current += 1;
+                data = (u16)*((u8*)(current + 1));
+                registers.ip += 1;
             }
             formatStringAdvance(out, "%d", (u32)data);
 
@@ -1388,10 +1599,61 @@ internal void computerEnhanceUpdate(GameMemory& memory)
         else if((*current >> 1) == immediateToMemoryMovOpcode)
         {
             formatStringAdvance(out, "mov ");
-            immediateToMemory(current, out);
+            registers.ip += immediateToMemory(current, out);
         }
         else if((*current >> 2) == immediateToMemoryAddOpcode)
         {
+            // @Note SIMULATION
+            {
+                u8 w   = (*current) & 1;
+                u8 mod = *(current + 1) >> 6;
+                u8 rm  = *(current + 1) & 0b111;
+                u8 valueIsSigned = (((*current) >> 1) & 1) > 0;
+
+                switch(mod)
+                {
+                    case 0b11:
+                    {
+                        s32 data = 0;
+                        if(w && valueIsSigned == 0)
+                        {
+                            data = valueIsSigned ? (s32)*((s16*)(current + 2)) : (s32)*((u16*)(current + 2));
+                        }
+                        else
+                        {
+                            data = valueIsSigned ? (s32)*((s8*)(current + 2)) : (s32)*((u8*)(current + 2));
+                        }
+
+                        RegisterIndex dstIndex = getRegisterIndex(rm, w);
+                        u16* dst = registers.registers + dstIndex.index;
+                        if(w)
+                        {
+                            u16 val = 0;
+                            switch((current[1] >> 3) & 0b111)
+                            {
+                                case  0b000: *dst += (s16)data; val = *dst; break;
+                                case  0b111: val = *dst - (s16)data; break;
+                                default: *dst -= (s16)data; val = *dst;break;
+                            }
+
+                            updateFlags16(val, registers);
+                        }
+                        else
+                        {
+                            u8 val = 0;
+                            u8* ds = (u8*)dst + ((dstIndex.part == 2) ? 1 : 0);
+                            switch((current[1] >> 3) & 0b111)
+                            {
+                                case  0b000: *ds += (s8)data; val = *ds; break;
+                                case  0b111:  val = *ds - (s8)data; break;
+                                default: *ds -= (s8)data; val = *ds; break;
+                            }
+                            updateFlags8(val, registers);
+                        }
+                        break;
+                    }
+                }
+            }
             if(((current[1] >> 3) & 0b111) == 0b000)
             {
                 formatStringAdvance(out, "add ");
@@ -1405,34 +1667,69 @@ internal void computerEnhanceUpdate(GameMemory& memory)
                 formatStringAdvance(out, "sub ");
             }
             u8 sign = ((*current) >> 1) & 1;
-            immediateToMemory(current, out, sign > 0);
+            registers.ip += immediateToMemory(current, out, sign > 0);
         }
         else if((*current >> 1) == immediateToAccumulatorAddOpCode 
              || (*current >> 1) == immediateToAccumulatorSubOpCode
              || (*current >> 1) == immediateToAccumulatorCmpOpCode)
         {
             char* operation;
+            u8 type = 0;
             switch(*current >> 1)
             {
-                case immediateToAccumulatorAddOpCode: operation = "add"; break;
-                case immediateToAccumulatorSubOpCode: operation = "sub"; break;
-                case immediateToAccumulatorCmpOpCode: operation = "cmp"; break;
+                case immediateToAccumulatorAddOpCode: operation = "add"; type = 0; break;
+                case immediateToAccumulatorSubOpCode: operation = "sub"; type = 1; break;
+                case immediateToAccumulatorCmpOpCode: operation = "cmp"; type = 2; break;
             }
+
             u32 w = (*current) & 1;
             ++current;
+            registers.ip += 1;
             s32 value = 0;
             if(w)
             {
                 value = *(s16*)current;
                 current += 2;
+                registers.ip += 2;
             }
             else
             {
                 value = *(s8*)current;
                 current += 1;
+                registers.ip += 1;
             }
-            
+
             formatStringAdvance(out, "%s %s, %i", operation,  w ? "AX" : "AL", value);
+
+            // @Note SIMULATION 
+            {
+                RegisterIndex destIndex = {};
+                destIndex.part = w ? 0 : 1;
+                
+                u16* dst = registers.registers + destIndex.index;
+                if(w)
+                {
+                    u16 val = 0;
+                    switch(type)
+                    {
+                        case 0: *dst += (s16)value; val = *dst; break;
+                        case 1: *dst -= (s16)value; val = *dst; break;
+                        case 2: val = *dst - (s16)value; break;
+                    }
+                    updateFlags16(val, registers);
+                }
+                else
+                {
+                    u8 val = 0;
+                    switch(type)
+                    {
+                        case 0: *(u8*)dst += (s8)value; val = *(u8*)dst; break;
+                        case 1: *(u8*)dst -= (s8)value; val = *(u8*)dst;break;
+                        case 2: val = *(u8*)dst - (s8)value; break;
+                    }
+                    updateFlags8(val, registers);
+                }
+            }            
         }
         else if((*current >> 1) == memoryToAccumulatorMovOpcode)
         {
@@ -1440,6 +1737,8 @@ internal void computerEnhanceUpdate(GameMemory& memory)
             ++current;
             u16 value  = *(u16*)current;
             current += 2;
+
+            registers.ip += 3;
             
             formatStringAdvance(out, "mov %s, [%d]", w ? "AX" : "AL", value);
         }
@@ -1449,11 +1748,13 @@ internal void computerEnhanceUpdate(GameMemory& memory)
             ++current;
             u16 value  = *(u16*)current;
             current += 2;
+            registers.ip += 3;
             formatStringAdvance(out, "mov [%d], %s", value, w ? "AX" : "AL");
         }
         else
         {
-            switch(*current)
+            u8 jumpType = *current;
+            switch(jumpType)
             {
                 case 0b01110100: formatStringAdvance(out, "je "); break;
                 case 0b01111100: formatStringAdvance(out, "jl "); break;
@@ -1481,17 +1782,87 @@ internal void computerEnhanceUpdate(GameMemory& memory)
             s32 value = *(s8*)current;
             formatStringAdvance(out, "%i", value);
             ++current;
+ 
+            // @Note SIMULATION
+            {
+                u32 oldValue = registers.ip;
+                switch(jumpType)
+                {
+                    case 0b01110100:  
+                    { // @Note JE
+                        if(registers.flags & ZF_FLAG)
+                        {
+                            registers.ip += value;
+                        }
+                        break;
+                    }
+                    case 0b01111100:  break;
+                    case 0b01111110:  break;
+                    case 0b01110010: 
+                    { // @Note JB
+                        if(registers.flags & CF_FLAG)
+                        {
+                            registers.ip += value;
+                        }
+                        break;
+                    }
+                    case 0b01110110:  break;
+                    case 0b01111010:  
+                    { // @Note JP
+                        if(registers.flags & PF_FLAG)
+                        {
+                            registers.ip += value;
+                        }
+                        break;
+                    }
+                    case 0b01110000:  break;
+                    case 0b01111000:  break;
+                    case 0b01110101: 
+                    { // @Note jne
+                        if((registers.flags & ZF_FLAG) == 0)
+                        {
+                            registers.ip += value;
+                        }
+                        break;
+                    } 
+                    case 0b01111101:  break;
+                    case 0b01111111:  break;
+                    case 0b01110011:  break;
+                    case 0b01110111:  break;
+                    case 0b01111011:  break;
+                    case 0b01110001: break;
+                    case 0b01111001: break;
+                    case 0b11100010: break;
+                    case 0b11100001:  break;
+                    case 0b11100000:  
+                    { // @Note loopnz
+                        u16* cx = registers.registers + 2;
+                        --*cx;              
+                        if(((registers.flags & ZF_FLAG) == 0) && (*cx != 0))
+                        {
+                            registers.ip += value;
+                        }
+                        break;
+                    }
+                    case 0b11100011: break;
+                }
+
+                if(registers.ip == oldValue)
+                {
+                    registers.ip += 2;
+                }
+            }
         }
         formatStringAdvance(out, "\n");
 
-        u32 s = (u32)(current - instructions);
-        if(s == instructionSize)
+        if(registers.ip == instructionSize)
         {
             break;
         }
-        Assert((u32)(current - instructions) < instructionSize);
+        Assert(registers.ip < instructionSize);
     }
 
     full.size = (u32)out.offset;
     platformApi.DEBUGWrite(full, fromC(DATA_PATH"ASM/ASM.asm"), memory.frame);
 }
+
