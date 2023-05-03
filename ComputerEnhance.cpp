@@ -10,6 +10,12 @@ inline bool isAccumulator(RegisterCode& reg)
     return reg.code == 0;
 }
 
+enum CPUStyle
+{
+    CPUStyle_8086,
+    CPUStyle_8088,
+};
+
 internal RegisterCode getRegisterCode(String registerName)
 {
     RegisterCode code= {};
@@ -552,6 +558,101 @@ struct OutputFormat
     ASMAtomic src;
 };
 
+struct MemoryAccessCost
+{
+    u32 ea;
+    u32 penalty;
+};
+
+
+internal MemoryAccessCost getMemoryAccesEstimation(Registers& regs, EffectiveAddress& adress, ImmediateSize size, u32 transfers, CPUStyle style)
+{
+    MemoryAccessCost res = {};
+
+    bool disp = false; 
+
+    switch(adress.mod)
+    {
+        case 0b00:
+        {
+            if(adress.rm == 6)
+            {
+                disp = true;
+            }
+            else
+            {
+                disp = false;
+            }
+            
+            break;
+        }
+        case 0b01:
+        {
+            disp = true;
+            break;
+        }
+        case 0b10:
+        {
+            disp = true;
+            break;
+        }
+        case 0b11:
+        {
+            disp = false;
+            break;
+        }
+    }
+
+    // @Robustness seems true when accessing through [bp], as in the encoding, there is a 0 displacement
+    if(adress.value == 0) 
+    {
+        disp = false;
+    }
+
+    switch(adress.rm)
+    {
+        case 0b000 : 
+        { 
+            res.ea = disp ? 11 : 7;
+            break;
+        }
+        case 0b001 : res.ea = disp ? 12 : 8; break;
+        case 0b010 : res.ea = disp ? 12 : 8; break; // "BP + SI"
+        case 0b011 : res.ea = disp ? 11 : 7; break; // "BP + DI"
+        case 0b100 : res.ea = disp ? 9 : 5; break; // SI
+        case 0b101 : res.ea = disp ? 9 : 5; break; // DI
+        case 0b110 : 
+        {
+            res.ea = disp ? (adress.mod == 0b00 ? 6 : 9) : 5; // BP or displacement only
+            break;
+        }
+        case 0b111 :  res.ea = disp ? 9 : 5; break; // BX
+    }
+
+    bool applyPenalty = false;
+    switch(style)
+    {
+        case CPUStyle_8086: 
+        {
+            u32 offset   = getEffectiveAddress(regs, adress.rm, adress.mod, adress.value);
+            applyPenalty = offset % 2 != 0 && size != ImmediateSize_Byte;
+            break;
+        }
+        case CPUStyle_8088:
+        {
+            applyPenalty = size != ImmediateSize_Byte;
+            break;
+        }
+    }
+    
+    if(applyPenalty)
+    {
+        res.penalty = 4 * transfers; // @Note unaligned penalty
+    }
+    
+    return res;
+}
+
 internal OutputFormat encodeImmediateToMemory(u8* current, bool sign = false)
 {
     OutputFormat result = {};
@@ -614,7 +715,7 @@ internal OutputFormat encodeImmediateToMemory(u8* current, bool sign = false)
     }
     else
     {
-        result.src.size = ImmediateSize_Byte;
+        result.src.size = w ? ImmediateSize_Word : ImmediateSize_Byte;
         result.src.immediate.value = sign ? (s32)*((s8*)current) : (s32)*((u8*)current);
         current += 1;
         result.inc += 1;
@@ -632,7 +733,7 @@ internal void outputASMAtomic(ASMAtomic& dst, OutputBuffer& out)
         break;
     
     case ASMType_EffectiveAddress:
-        outputEffectiveAddress(out, dst.effective.rm, dst.effective.neg ? -dst.effective.value : dst.effective.value, dst.size > 0);
+        outputEffectiveAddress(out, dst.effective.rm, dst.effective.neg ? -dst.effective.value : dst.effective.value, dst.effective.mod == 0);
         break;
     }
 }
@@ -650,7 +751,7 @@ internal void immediateToMemory(OutputFormat& f, OutputBuffer& out)
     {
         formatStringAdvance(out, "word ");
     }
-    formatStringAdvance(out, "%c%i", f.dst.immediate.neg ? '-' : ' ', f.dst.immediate.value);
+    formatStringAdvance(out, f.src.immediate.neg ? "-%i" : "%i", f.src.immediate.value);
 }
 
 internal OutputFormat encodeRegisterToRegister(u8* current)
@@ -978,10 +1079,9 @@ struct LabelQueueItem
 
 internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& assets, GameMemory& memory)
 {
-    // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0045_challenge_register_movs.asm"), memory.frame);
-    // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0047_challenge_flags.asm"), memory.frame);
-    // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0054_draw_rectangle.asm"), memory.frame);
-    String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0055_challenge_rectangle.asm"), memory.frame);
+    // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0055_challenge_rectangle.asm"), memory.frame);
+    String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0056_estimating_cycles.asm"), memory.frame);
+    // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0057_challenge_cycles.asm"), memory.frame);
     Tokenizer tokenizer = tokenize(asmContent);
 
     RenderGroup group = initOrthographic(&commands, &assets);
@@ -996,8 +1096,10 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
     Label labels[8];
     u32 labelCount = 0;
 
-    Registers registers = {};
-    u8 simulationMemory[U16Max]   = {};
+    u32 estimation              = 0;
+    Registers registers         = {};
+    u8 simulationMemory[U16Max] = {};
+    CPUStyle cpu                = CPUStyle_8088;
 
     LabelQueueItem labelQueue[64];
     u32 queueCount = 0;
@@ -1514,12 +1616,65 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                 OutputFormat f = encodeRegisterToRegister(current);
                 registers.ip  += f.inc;
 
+                ImmediateSize size = getSize(f.dst, f.src);
+                // @Note ESTIMATIONS
+                switch(f.dst.type)
+                {
+                    case ASMType_EffectiveAddress:
+                    {
+                        switch(f.src.type)
+                        {
+                            case ASMType_Register:
+                            {
+                                estimation += 9;
+                                break;
+                            }
+                            case ASMType_Immediate:
+                            {
+                                estimation += 10;
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        MemoryAccessCost access = getMemoryAccesEstimation(registers, f.dst.effective, size, 1, cpu);
+                        estimation += access.ea;
+                        estimation += access.penalty;
+                        break;
+                    }
+                    case ASMType_Register:
+                    {
+                        switch(f.src.type)
+                        {
+                            case ASMType_Register:
+                            {
+                                estimation += 2;
+                                break;
+                            }
+                            case ASMType_Immediate:
+                            {
+                                estimation += 4;
+                                break;
+                            }
+                            case ASMType_EffectiveAddress:
+                            {
+                                estimation += 8;
+                                MemoryAccessCost access = getMemoryAccesEstimation(registers, f.src.effective, size, 1, cpu);
+                                estimation += access.ea;
+                                estimation += access.penalty;
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        break;
+                    }
+                    InvalidDefaultCase
+                }
+
                 // @Note SIMULATION
                 {
                     u8* dst = getRegisterOrAddress(f.dst, registers, simulationMemory);
                     u8* src = getRegisterOrAddress(f.src, registers, simulationMemory);
 
-                    ImmediateSize size = getSize(f.dst, f.src);
                     switch(size)
                     {
                         case ImmediateSize_Byte:
@@ -1534,6 +1689,8 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                         }
                     }
                 }
+
+                
 
                 formatStringAdvance(out, "mov ");
                 outputRegisterToRegister(f.dst, f.src, out);
@@ -1553,6 +1710,8 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     u16* dst = registers.segmentRegisters + reg;
                     *dst = *src;
                 }
+
+                estimation += 2;
 
                 formatStringAdvance(out, "mov ");
                 getSegmentRegisterName(reg, out);
@@ -1575,6 +1734,8 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     *dst = *src;
                 }
 
+                estimation += 2;
+
                 formatStringAdvance(out, "mov ");
                 getRegisterName(rm, w, out);
                 formatStringAdvance(out, ", ");
@@ -1586,12 +1747,65 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
             {
                 OutputFormat f = encodeRegisterToRegister(current);
                 registers.ip  += f.inc;
+                ImmediateSize size = getSize(f.dst, f.src);
 
+                // @Note Estimations
+                switch(f.dst.type)
+                {
+                    case ASMType_EffectiveAddress:
+                    {
+                        switch(f.src.type)
+                        {
+                            case ASMType_Register:
+                            {
+                                estimation += 16;
+                                break;
+                            }
+                            case ASMType_Immediate:
+                            {
+                                estimation += 17;
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        MemoryAccessCost a = getMemoryAccesEstimation(registers, f.dst.effective, size, 2, cpu);
+                        estimation += a.ea;
+                        estimation += a.penalty;
+                        break;
+                    }
+                    case ASMType_Register:
+                    {
+                        switch(f.src.type)
+                        {
+                            case ASMType_Register:
+                            {
+                                estimation += 3;
+                                break;
+                            }
+                            case ASMType_Immediate:
+                            {
+                                estimation += 4;
+                                break;
+                            }
+                            case ASMType_EffectiveAddress:
+                            {
+                                estimation += 9;
+                                MemoryAccessCost a = getMemoryAccesEstimation(registers, f.src.effective, size, 1, cpu);
+                                estimation += a.ea;
+                                estimation += a.penalty;
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        break;
+                    }
+                    InvalidDefaultCase
+                }
                 // @Note SIMULATION 
                 {
                     u8* dst            = getRegisterOrAddress(f.dst, registers, simulationMemory);
                     u8* src            = getRegisterOrAddress(f.src, registers, simulationMemory);
-                    ImmediateSize size = getSize(f.dst, f.src);
+                    
                     
                     if(size == ImmediateSize_Word)
                     {
@@ -1603,6 +1817,8 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                         *dst += *src;
                         updateFlags8(*dst, registers);
                     }
+
+                    
                 }    
 
                 formatStringAdvance(out, "add ");
@@ -1612,12 +1828,65 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
             {
                 OutputFormat f = encodeRegisterToRegister(current);
                 registers.ip  += f.inc;
+                ImmediateSize size = getSize(f.dst, f.src);
 
+                // @Note Estimations
+                switch(f.dst.type)
+                {
+                    case ASMType_EffectiveAddress:
+                    {
+                        switch(f.src.type)
+                        {
+                            case ASMType_Register:
+                            {
+                                estimation += 16;
+                                break;
+                            }
+                            case ASMType_Immediate:
+                            {
+                                estimation += 17;
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        MemoryAccessCost a = getMemoryAccesEstimation(registers, f.dst.effective, size, 2, cpu);
+                        estimation += a.ea;
+                        estimation += a.penalty;
+                        break;
+                    }
+                    case ASMType_Register:
+                    {
+                        switch(f.src.type)
+                        {
+                            case ASMType_Register:
+                            {
+                                estimation += 3;
+                                break;
+                            }
+                            case ASMType_Immediate:
+                            {
+                                estimation += 5;
+                                break;
+                            }
+                            case ASMType_EffectiveAddress:
+                            {
+                                estimation += 9;
+                                MemoryAccessCost a = getMemoryAccesEstimation(registers, f.src.effective, size , 1, cpu);
+                                estimation += a.ea;
+                                estimation += a.penalty;
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        break;
+                    }
+                    InvalidDefaultCase
+                }
                 // @Note SIMULATION 
                 {
                     u8* dst            = getRegisterOrAddress(f.dst, registers, simulationMemory);
                     u8* src            = getRegisterOrAddress(f.src, registers, simulationMemory);
-                    ImmediateSize size = getSize(f.dst, f.src);
+                    
                     
                     if(size == ImmediateSize_Word)
                     {
@@ -1629,6 +1898,8 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                         *dst -= *src;
                         updateFlags8(*dst, registers);
                     }
+
+                    
                 }    
 
                 formatStringAdvance(out, "sub ");
@@ -1638,12 +1909,65 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
             {
                 OutputFormat f = encodeRegisterToRegister(current);
                 registers.ip  += f.inc;
+                ImmediateSize size = getSize(f.dst, f.src);
 
+                // @Note estimations
+                switch(f.dst.type)
+                {
+                    case ASMType_EffectiveAddress:
+                    {
+                        switch(f.src.type)
+                        {
+                            case ASMType_Register:
+                            {
+                                estimation += 9;
+                                break;
+                            }
+                            case ASMType_Immediate:
+                            {
+                                estimation += 10;
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        MemoryAccessCost a = getMemoryAccesEstimation(registers, f.dst.effective, size, 1, cpu);
+                        estimation += a.ea;
+                        estimation += a.penalty;
+                        break;
+                    }
+                    case ASMType_Register:
+                    {
+                        switch(f.src.type)
+                        {
+                            case ASMType_Register:
+                            {
+                                estimation += 3;
+                                break;
+                            }
+                            case ASMType_Immediate:
+                            {
+                                estimation += 4;
+                                break;
+                            }
+                            case ASMType_EffectiveAddress:
+                            {
+                                estimation += 9;
+                                MemoryAccessCost a = getMemoryAccesEstimation(registers, f.src.effective, size, 1, cpu);
+                                estimation += a.ea;
+                                estimation += a.penalty;
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        break;
+                    }
+                    InvalidDefaultCase
+                }
                 // @Note SIMULATION 
                 {
                     u8* dst            = getRegisterOrAddress(f.dst, registers, simulationMemory);
                     u8* src            = getRegisterOrAddress(f.src, registers, simulationMemory);
-                    ImmediateSize size = getSize(f.dst, f.src);
+                    
                     
                     if(size == ImmediateSize_Word)
                     {
@@ -1695,6 +2019,8 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     {
                         *((u8*)dst + ((index.part == 2) ? 1 : 0)) = (u8)data;
                     }
+
+                    estimation += 4;
                 }
             }
             else if((*current >> 1) == immediateToMemoryMovOpcode)
@@ -1702,9 +2028,13 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                 OutputFormat format = encodeImmediateToMemory(current);
                 registers.ip += format.inc;
 
+                ImmediateSize size = getSize(format.dst, format.src);
+
                 formatStringAdvance(out, "mov ");
                 immediateToMemory(format, out);
 
+                MemoryAccessCost a = getMemoryAccesEstimation(registers, format.dst.effective, size, 1, cpu);
+                estimation += a.ea + a.penalty + 10;
                 // @Note SIMULATION
                 {
                     u8 w = (*current) & 1;
@@ -1764,6 +2094,59 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                 u8 valueIsSigned = (((*current) >> 1) & 1) > 0;
                 OutputFormat format = encodeImmediateToMemory(current, valueIsSigned);
                 registers.ip += format.inc;
+                ImmediateSize size = getSize(format.dst, format.src);
+                // @Improve copy paste from other ADD
+                switch(format.dst.type)
+                {
+                    case ASMType_EffectiveAddress:
+                    {
+                        switch(format.src.type)
+                        {
+                            case ASMType_Register:
+                            {
+                                estimation += 16;
+                                break;
+                            }
+                            case ASMType_Immediate:
+                            {
+                                estimation += 17;
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        MemoryAccessCost a = getMemoryAccesEstimation(registers, format.dst.effective, size, 2, cpu);
+                        estimation += a.ea;
+                        estimation += a.penalty;
+                        break;
+                    }
+                    case ASMType_Register:
+                    {
+                        switch(format.src.type)
+                        {
+                            case ASMType_Register:
+                            {
+                                estimation += 3;
+                                break;
+                            }
+                            case ASMType_Immediate:
+                            {
+                                estimation += 4;
+                                break;
+                            }
+                            case ASMType_EffectiveAddress:
+                            {
+                                estimation += 9;
+                                MemoryAccessCost a = getMemoryAccesEstimation(registers, format.src.effective, size, 1, cpu);
+                                estimation += a.ea;
+                                estimation += a.penalty;
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        break;
+                    }
+                    InvalidDefaultCase
+                }
 
                 // @Note SIMULATION
                 {
@@ -1890,6 +2273,8 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                         }
                         updateFlags8(val, registers);
                     }
+
+                    estimation += 4;
                 }            
             }
             else if((*current >> 1) == memoryToAccumulatorMovOpcode)
@@ -1914,6 +2299,8 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     {
                         *(u8*)(registers.registers + 0) = *mem;
                     }
+
+                    estimation += 10;
                 }
             }
             else if ((*current >> 1) == accumulatorToMemoryMovOpcode)
@@ -1936,6 +2323,8 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     {
                         *mem = *(u8*)(registers.registers + 0);
                     }
+
+                    estimation += 10;
                 }
             }
             else
@@ -2062,25 +2451,52 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
         platformApi.DEBUGWrite(full, fromC(DATA_PATH"ASM/ASM.asm"), memory.frame);
     }
 
-    Image image  = {};
-    image.width  = 64;
-    image.height = 64;
-    image.pixels = (u32*)(simulationMemory + 256);
+    globalVariable r32 t;
+    t += 0.005f;
+    M4x4 r = zRotation(t);
 
-    globalVariable TextureHandle handle;
+    Vector3 xAxis = r * v3(1, 0, 0);
+    Vector3 yAxis = r * v3(0, 1, 0);
 
-    if(isValid(handle) == false)
-    {
-        handle = getNextTextureHandle(assets, image.width, image.height);
-    }
-    else
-    {
-        TextureOperation* op    = beginTextureOp(*assets.textureQueue, handle);
-        Intrinsics::memcpy(op->data, image.pixels, size(image));
-        completeTextureOp(*assets.textureQueue, op);
+    FontInstance font = pushFont(group, Font_PressStart2P, 40);
+    TextShapeAllocated shape = textOperation(TextOp_DrawText, 
+                                         *font.font,
+                                          group,
+                                          asmContent.content,
+                                          asmContent.size,
+                                          toV3(topLeft(getWholeScreenInPixels(group)), 0.f),
+                                          memory.frame,
+                                          RGBA_PACK(1, 1, 1, 1),
+                                          font.pixelHeight,
+                                          1.f,
+                                          xAxis,
+                                          yAxis,
+                                         v3(0),
+                                         RGBA_PACK_V(Color_black));
 
-        r32 mul = 30;
-        pushSprite(group, handle, toV3(screen.min, 0.f), v3(64.f * mul, 0.f, 0.f), v3(0.f, 64.f * mul, 0.f), Color_white);
-    }
+    char tmp[64];
+    u32 s = formatString(tmp, ArrayCount(tmp), "Cycles for %S : %d", getNameOf(CPUStyle, cpu), estimation);
+    pushTextAt(group, font,  fromC(tmp, s), v3(600,0,0), finalizeColor(Color_white));
+
+    // Image image  = {};
+    // image.width  = 64;
+    // image.height = 64;
+    // image.pixels = (u32*)(simulationMemory + 256);
+
+    // globalVariable TextureHandle handle;
+
+    // if(isValid(handle) == false)
+    // {
+    //     handle = getNextTextureHandle(assets, image.width, image.height);
+    // }
+    // else
+    // {
+    //     TextureOperation* op    = beginTextureOp(*assets.textureQueue, handle);
+    //     Intrinsics::memcpy(op->data, image.pixels, size(image));
+    //     completeTextureOp(*assets.textureQueue, op);
+
+    //     r32 mul = 30;
+    //     pushSprite(group, handle, toV3(screen.min, 0.f), v3(64.f * mul, 0.f, 0.f), v3(0.f, 64.f * mul, 0.f), Color_white);
+    // }
 }
 
