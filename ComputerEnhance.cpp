@@ -282,6 +282,11 @@ inline void getSegmentRegisterName(u8 reg, OutputBuffer& out)
 #define immediateToAccumulatorCmpOpCode    0b0011110    
 #define registerToSegmentRegisterMovOpcode 0b10001110    
 #define segmentRegisterToRegisterMovOpcode 0b10001100    
+#define incRegisterOpCode                  0b01000    
+#define decRegisterOpCode                  0b01001    
+#define registerToRegisterXorOpcode        0b001100
+#define registerToRegisterTestOpcode       0b000100
+#define registerShiftRightOpcode           0b110100
 
 
 internal ASMAtomic readAtomic(Tokenizer& tokenizer)
@@ -549,6 +554,12 @@ enum OpCodeType
     OpCodeType_Sub,
     OpCodeType_Cmp,
     OpCodeType_Jump,
+    OpCodeType_Test,
+    OpCodeType_Xor,
+    OpCodeType_Inc,
+    OpCodeType_ShiftRight,
+    OpCodeType_ShiftRightArithmetic,
+    OpCodeType_Dec,
 };
 
 struct OutputFormat
@@ -1068,6 +1079,7 @@ enum NextParsing
 {
     NextParsing_None,
     NextParsing_Operation,
+    NextParsing_SingleOperation,
     NextParsing_Label,
 };
 
@@ -1077,10 +1089,11 @@ struct LabelQueueItem
     String name;
 };
 
-internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& assets, GameMemory& memory)
+internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& assets, GameMemory& memory, r32 dt)
 {
     // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0055_challenge_rectangle.asm"), memory.frame);
-    String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0056_estimating_cycles.asm"), memory.frame);
+    String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0064_TreeScalarPtr.asm"), memory.frame);
+    // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0057_challenge_cycles.asm"), memory.frame);
     // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0057_challenge_cycles.asm"), memory.frame);
     Tokenizer tokenizer = tokenize(asmContent);
 
@@ -1117,6 +1130,11 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
             }
             case Token_EndOfStream:
             {
+                break;
+            }
+            case Token_Dot:
+            {
+                // @Note probably a label, just read next one
                 break;
             }
             case Token_Identifier:
@@ -1274,6 +1292,36 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     next       = NextParsing_Label;
                     jumpOpCode = 0b11100011;
                 }
+                else if(stringsAreEqual(op.text, fromC("test")))
+                {
+                    type       = OpCodeType_Test;
+                    next       = NextParsing_Operation;
+                }
+                else if(stringsAreEqual(op.text, fromC("xor")))
+                {
+                    type       = OpCodeType_Xor;
+                    next       = NextParsing_Operation;
+                }
+                else if(stringsAreEqual(op.text, fromC("inc")))
+                {
+                    type       = OpCodeType_Inc;
+                    next       = NextParsing_SingleOperation;
+                }
+                else if(stringsAreEqual(op.text, fromC("shr")))
+                {
+                    type       = OpCodeType_ShiftRight;
+                    next       = NextParsing_Operation;
+                }
+                else if(stringsAreEqual(op.text, fromC("sar")))
+                {
+                    type       = OpCodeType_ShiftRightArithmetic;
+                    next       = NextParsing_Operation;
+                }
+                else if(stringsAreEqual(op.text, fromC("dec")))
+                {
+                    type       = OpCodeType_Dec;
+                    next       = NextParsing_SingleOperation;
+                }
                 else 
                 {
                     Token nextToken = getToken(tokenizer);
@@ -1287,6 +1335,43 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
 
                 switch(next)
                 {
+                    case NextParsing_SingleOperation:
+                    {
+                        ASMAtomic r0 = readAtomic(tokenizer);
+                        switch(type)
+                        {
+                            case OpCodeType_Inc:
+                            {
+                                switch(r0.type)
+                                {
+                                    case ASMType_Register:
+                                    {
+                                        *current = (incRegisterOpCode << 3) | r0.reg.code;
+                                        ++current;
+                                        break;
+                                    }
+                                    InvalidDefaultCase
+                                }
+                                break;
+                            }
+                            case OpCodeType_Dec:
+                            {
+                                switch(r0.type)
+                                {
+                                    case ASMType_Register:
+                                    {
+                                        *current = (decRegisterOpCode << 3) | r0.reg.code;
+                                        ++current;
+                                        break;
+                                    }
+                                    InvalidDefaultCase
+                                }
+                                break;
+                            }
+                            InvalidDefaultCase
+                        }
+                        break;
+                    }
                     case NextParsing_Operation:
                     {
                         ASMAtomic r0 = readAtomic(tokenizer);
@@ -1314,6 +1399,22 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                                     u8 opCode;
                                     switch(type)
                                     {
+                                        case OpCodeType_ShiftRightArithmetic:
+                                        case OpCodeType_ShiftRight:
+                                        {
+                                            InvalidCodePath
+                                            break;
+                                        }
+                                        case OpCodeType_Test:
+                                        {
+                                            opCode = registerToRegisterTestOpcode;
+                                            break;
+                                        }
+                                        case OpCodeType_Xor: // @Robustness Xor to memory not implemented
+                                        {
+                                            opCode = registerToRegisterXorOpcode; 
+                                            break;
+                                        }
                                         case OpCodeType_Mov: 
                                         {
                                             if(r0.reg.isSegmentRegister == 1)
@@ -1362,6 +1463,29 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                                 {
                                     switch(type)
                                     {
+                                        case OpCodeType_ShiftRightArithmetic:
+                                        case OpCodeType_ShiftRight:
+                                        {
+                                            // @Note if v is 0, we shift by one, else, the count is in the cl register
+                                            u8 v = r1.immediate.value == 1 ? 0 : 1;
+                                            u8 w = r0.size == ImmediateSize_Byte ? 0 : 1;
+                                            *current = (registerShiftRightOpcode << 2) | (v << 1) | w;
+                                            u8 middle = type == OpCodeType_ShiftRight ? 0b101 : 0b111;
+                                            current[1] = (0b11 << 6) | (middle << 3) | r0.reg.code;
+                                            current += 2;
+
+                                            break;
+                                        }
+                                        case OpCodeType_Test:
+                                        {
+                                            InvalidCodePath;
+                                            break;
+                                        }
+                                        case OpCodeType_Xor: // @Robustness Xor to memory not implemented
+                                        {
+                                            InvalidCodePath;
+                                            break;
+                                        }
                                         case OpCodeType_Mov:
                                         {
                                             u8 opCode = immediateToRegisterMovOpcode;
@@ -1443,6 +1567,22 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                                         u8 opCode;
                                         switch(type)
                                         {
+                                            case OpCodeType_ShiftRightArithmetic:
+                                            case OpCodeType_ShiftRight:
+                                            {
+                                                InvalidCodePath
+                                                break;
+                                            }
+                                            case OpCodeType_Test:
+                                            {
+                                                InvalidCodePath;
+                                                break;
+                                            }
+                                            case OpCodeType_Xor:
+                                            {
+                                                InvalidCodePath;
+                                                break;
+                                            }
                                             case OpCodeType_Mov: opCode = registerToRegisterMovOpcode; break;
                                             case OpCodeType_Add: opCode = registerToRegisterAddOpcode; break;
                                             case OpCodeType_Sub: opCode = registerToRegisterSubOpcode; break;
@@ -1534,6 +1674,10 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     case NextParsing_Label:
                     {
                         Token labelName = getToken(tokenizer);
+                        if(labelName.type == Token_Dot) // @Note Clang and GCC output ".Label" ASM
+                        {
+                            labelName = getToken(tokenizer);
+                        }
                         Assert(labelName.type == Token_Identifier);
 
                         *current = jumpOpCode;
@@ -1597,6 +1741,10 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
     }
 
     u32 instructionSize = (u32)(current - instructions);
+    String full;
+    full.size = (u32)kilobytes(512);
+    full.content = PushArray(memory.frame, u8, full.size);
+
     if(instructionSize)
     {
         Stream stream = createStream(SubArena(memory.frame, (u32)kilobytes(512)));
@@ -1604,13 +1752,12 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
 
         PlatformWriteResult res = platformApi.writeStream(stream, fromC("../data/ASM/binaryASM"), memory.frame);
 
-        String full;
-        full.size = (u32)kilobytes(512);
-        full.content = PushArray(memory.frame, u8, full.size);
+        
         OutputBuffer out = makeOutputBuffer(full);
         for(;;)
         {
             u8* current = instructions + registers.ip;
+
             if (((*current) >> 2) == registerToRegisterMovOpcode)
             {
                 OutputFormat f = encodeRegisterToRegister(current);
@@ -1810,7 +1957,7 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     if(size == ImmediateSize_Word)
                     {
                         *(u16*)dst += *(u16*)src;
-                        updateFlags16(*dst, registers);
+                        updateFlags16(*(u16*)dst, registers);
                     }
                     else
                     {
@@ -1891,7 +2038,7 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     if(size == ImmediateSize_Word)
                     {
                         *(u16*)dst -= *(u16*)src;
-                        updateFlags16(*dst, registers);
+                        updateFlags16(*(u16*)dst, registers);
                     }
                     else
                     {
@@ -2327,6 +2474,162 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     estimation += 10;
                 }
             }
+            else if((*current >> 3) == incRegisterOpCode)
+            {
+                u8 reg = *current & 0b111;
+                registers.ip += 1;
+                ASMAtomic regi = getRegisterCode(reg, 1);
+
+                // @Note Simulation
+                u8* dst = getRegisterOrAddress(regi, registers, simulationMemory);
+                if(regi.reg.w)
+                {
+                    ++(*(u16*)dst);
+                    updateFlags16(*(u16*)dst, registers);
+                }
+                else
+                {
+                    ++(*dst);
+                    updateFlags8(*dst, registers);
+                }
+
+                // @Note Output
+                formatStringAdvance(out, "inc ");
+                getRegisterName(regi.reg.code, regi.reg.w, out);
+
+                // @Note Estimation
+                estimation += regi.reg.w ? 2 : 3;
+            }
+            else if((*current >> 3) == decRegisterOpCode)
+            {
+                u8 reg = *current & 0b111;
+                registers.ip += 1;
+                ASMAtomic regi = getRegisterCode(reg, 1);
+
+                // @Note Simulation
+                u8* dst = getRegisterOrAddress(regi, registers, simulationMemory);
+                if(regi.reg.w)
+                {
+                    --(*(u16*)dst);
+                    updateFlags16(*(u16*)dst, registers);
+                }
+                else
+                {
+                    --(*dst);
+                    updateFlags8(*dst, registers);
+                }
+
+                // @Note Output
+                formatStringAdvance(out, "dec ");
+                getRegisterName(regi.reg.code, regi.reg.w, out);
+
+                // @Note Estimation
+                estimation += regi.reg.w ? 2 : 3;
+            }
+            else if ((*current >> 2) == registerToRegisterXorOpcode)
+            {
+                OutputFormat f = encodeRegisterToRegister(current);
+                registers.ip  += f.inc;
+                ImmediateSize size = getSize(f.dst, f.src);
+
+                // @Note Estimation
+                estimation += 3; // @CleanUp only register to register XOR here, no immediate or memory
+
+                // @Note Simulation
+                u8* dst = getRegisterOrAddress(f.dst, registers, simulationMemory);
+                u8* src = getRegisterOrAddress(f.src, registers, simulationMemory);
+
+                if(size == ImmediateSize_Word)
+                {
+                    *(u16*)dst ^= *(u16*)src;
+                    updateFlags16(*(u16*)dst, registers);
+                }
+                else
+                {
+                    *dst ^= *src;
+                    updateFlags8(*dst, registers);
+                }
+
+                // @Note output 
+                formatStringAdvance(out, "xor ");
+                getRegisterName(f.dst.reg.code, f.dst.reg.w, out);
+                formatStringAdvance(out, ", ");
+                getRegisterName(f.src.reg.code, f.src.reg.w, out);
+            }
+            else if ((*current >> 2) == registerToRegisterTestOpcode)
+            {
+                OutputFormat f = encodeRegisterToRegister(current);
+                registers.ip  += f.inc;
+                ImmediateSize size = getSize(f.dst, f.src);
+
+                // @Note Simulation
+                u8* dst = getRegisterOrAddress(f.dst, registers, simulationMemory);
+                u8* src = getRegisterOrAddress(f.src, registers, simulationMemory);
+
+                if(size == ImmediateSize_Word)
+                {
+                    u16 d = *(u16*)src & *(u16*)dst;
+                    updateFlags16(d, registers);
+                }
+                else
+                {
+                    u8 d = *src & *dst;
+                    updateFlags8(d, registers);
+                }
+
+                // @Note Estimation
+                estimation += 3;
+
+                // @Note output 
+                formatStringAdvance(out, "test ");
+                getRegisterName(f.dst.reg.code, f.dst.reg.w, out);
+                formatStringAdvance(out, ", ");
+                getRegisterName(f.src.reg.code, f.src.reg.w, out);
+            }
+            else if((*current >> 2) == registerShiftRightOpcode)
+            {
+                u8 v   = ((*current) >> 1) & 1;
+                u8 w   = (*current) & 1;
+                u8 mod = *(current + 1) >> 6;
+                u8 val = (*(current + 1) >> 3) & 0b111;
+                u8 rm  = *(current + 1) & 0b111;
+                registers.ip  += 2;
+
+                switch(val)
+                {
+                    case 0b111: NotImplemented; break;// Shift Arithmetic Right
+                    case 0b101:
+                    {
+                        // @Note Shift Right
+                        Assert(mod == 0b11); // @Note only registers for now
+                        Assert(v == 0); // @Note only shift right 1
+                        ASMAtomic code = getRegisterCode(rm, w);
+
+                        // @Note Estimation
+                        estimation += 2;
+
+                        // @Note output
+                        formatStringAdvance(out, "shr ");
+                        getRegisterName(code.reg.code, code.reg.w, out);
+                        formatStringAdvance(out, ", 1");
+
+                        // @Note Simulation
+                        u8* dst = getRegisterOrAddress(code, registers, simulationMemory);
+
+                        if(w)
+                        {
+                            *(u16*)dst >>= 1;
+                            updateFlags16(*dst, registers);
+                        }
+                        else
+                        {
+                            *dst >>= 1;
+                            updateFlags8(*dst, registers);
+                        }
+                        break;
+                    }
+                }
+            }
             else
             {
                 u8 jumpType = *current;
@@ -2358,6 +2661,91 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                 s32 value = *(s8*)current;
                 formatStringAdvance(out, "%i", value);
                 ++current;
+
+                // @Note Estimation
+                {
+                    switch(jumpType)
+                    {
+                        case 0b01110100:  
+                        { // @Note JE
+                            if(registers.flags & ZF_FLAG)
+                            {
+
+                            }
+                            break;
+                        }
+                        case 0b01111100:  break;
+                        case 0b01111110:  break;
+                        case 0b01110010: 
+                        { // @Note JB
+                            if(registers.flags & CF_FLAG)
+                            {
+                                estimation += 16;
+                            }
+                            else
+                            {
+                                estimation += 4;
+                            }
+                            break;
+                        }
+                        case 0b01110110:  break;
+                        case 0b01111010:  
+                        { // @Note JP
+                            if(registers.flags & PF_FLAG)
+                            {
+                                estimation += 16;
+                            }
+                            else
+                            {
+                                estimation += 4;
+                            }
+                            break;
+                        }
+                        case 0b01110000:  break;
+                        case 0b01111000:  break;
+                        case 0b01110101: 
+                        { // @Note jne
+                            if((registers.flags & ZF_FLAG) == 0)
+                            {
+                                estimation += 16;
+                            }
+                            else
+                            {
+                                estimation += 4;
+                            }
+                            break;
+                        } 
+                        case 0b01111101:  break;
+                        case 0b01111111:  break;
+                        case 0b01110011:  break;
+                        case 0b01110111:  break;
+                        case 0b01111011:  break;
+                        case 0b01110001: break;
+                        case 0b01111001: break;
+                        case 0b11100010: 
+                        {
+                            u16* cx = registers.registers + 2;
+                            --*cx;          
+                            if(*cx > 0)
+                            {
+                                registers.ip += value;
+                            }    
+                            break; // @Note loop
+                        }
+                        case 0b11100001:  break;
+                        case 0b11100000:  
+                        { // @Note loopnz
+                            u16* cx = registers.registers + 2;
+                            --*cx;              
+                            if(((registers.flags & ZF_FLAG) == 0) && (*cx != 0))
+                            {
+                                registers.ip += value;
+                            }
+                            break;
+                        }
+                        case 0b11100011: break;
+                    }
+                }
     
                 // @Note SIMULATION
                 {
@@ -2438,7 +2826,7 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                     }
                 }
             }
-            formatStringAdvance(out, "\n");
+            formatStringAdvance(out, "\r\n");
 
             if(registers.ip == instructionSize)
             {
@@ -2448,11 +2836,13 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
         }
 
         full.size = (u32)out.offset;
+        #if INTERNAL_BUILD
         platformApi.DEBUGWrite(full, fromC(DATA_PATH"ASM/ASM.asm"), memory.frame);
+        #endif
     }
 
     globalVariable r32 t;
-    t += 0.005f;
+    // t += dt;
     M4x4 r = zRotation(t);
 
     Vector3 xAxis = r * v3(1, 0, 0);
@@ -2474,9 +2864,43 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
                                          v3(0),
                                          RGBA_PACK_V(Color_black));
 
+    Vector3 registersPosition = v3(1000, -500, 0);
     char tmp[64];
     u32 s = formatString(tmp, ArrayCount(tmp), "Cycles for %S : %d", getNameOf(CPUStyle, cpu), estimation);
-    pushTextAt(group, font,  fromC(tmp, s), v3(600,0,0), finalizeColor(Color_white));
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition, finalizeColor(Color_white));
+
+    s = formatString(tmp, ArrayCount(tmp), "AX : %d", registers.registers[0]);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,100,0), finalizeColor(Color_white));
+    s = formatString(tmp, ArrayCount(tmp), "BX : %d", registers.registers[1]);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,200,0), finalizeColor(Color_white));
+    s = formatString(tmp, ArrayCount(tmp), "CX : %d", registers.registers[2]);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition+  v3(0,300,0), finalizeColor(Color_white));
+    s = formatString(tmp, ArrayCount(tmp), "DX : %d", registers.registers[3]);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,400,0), finalizeColor(Color_white));
+    s = formatString(tmp, ArrayCount(tmp), "SP : %d", registers.registers[4]);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition +v3(0,500,0), finalizeColor(Color_white));
+    s = formatString(tmp, ArrayCount(tmp), "BP : %d", registers.registers[5]);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,600,0), finalizeColor(Color_white));
+    s = formatString(tmp, ArrayCount(tmp), "SI : %d", registers.registers[6]);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,700,0), finalizeColor(Color_white));
+    s = formatString(tmp, ArrayCount(tmp), "DI : %d", registers.registers[7]);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,800,0), finalizeColor(Color_white));
+
+    TextShapeAllocated shape2 = textOperation(TextOp_DrawText, 
+                                         *font.font,
+                                          group,
+                                          full.content,
+                                          full.size,
+                                          toV3(topLeft(getWholeScreenInPixels(group)) + v2(1600.f, -600.f), 0.f),
+                                          memory.frame,
+                                          RGBA_PACK(1, 0, 1, 1),
+                                          font.pixelHeight,
+                                          1.f,
+                                          xAxis,
+                                          yAxis,
+                                         v3(0),
+                                         RGBA_PACK_V(Color_black));
+    
 
     // Image image  = {};
     // image.width  = 64;
