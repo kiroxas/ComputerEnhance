@@ -1089,10 +1089,37 @@ struct LabelQueueItem
     String name;
 };
 
-internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& assets, GameMemory& memory, r32 dt)
+struct ComputerEnhanceContext
 {
+    r32  textScale;
+    char fileName[128];
+    u32  fileNameSize;
+
+    r32 lerpRatio;
+    CPUStyle cpu;
+    r32 toggleTime;
+};
+
+internal void initComputerEnhance(GameState* state, MemoryArena& temporary)
+{
+    setGameMode(*state, GameMode_ComputerEnhance, temporary);
+    state->enhance = PushMemory(temporary, ComputerEnhanceContext);
+
+    state->enhance->textScale = 1.f;
+    state->enhance->fileNameSize = formatString(state->enhance->fileName, ArrayCount(state->enhance->fileName), DATA_PATH"ASM/listing_0064_TreeScalarPtr.asm");
+}
+
+internal void computerEnhanceUpdate(GameRenderCommand& commands, ComputerEnhanceContext& context, GameAssets& assets, GameMemory& memory, DevUIContext& ui, Inputs& inputs, r32 dt)
+{
+    context.lerpRatio = clamp01(context.lerpRatio - dt * 4);
+    if(memory.filesDroppedCount)
+    {
+        context.fileNameSize = memory.filesDropped[0].size;
+        Intrinsics::memcpy(context.fileName, memory.filesDropped[0].content, context.fileNameSize);
+        context.lerpRatio = 1.f;
+    }
     // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0055_challenge_rectangle.asm"), memory.frame);
-    String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0064_TreeScalarPtr.asm"), memory.frame);
+    String asmContent   = platformApi.readFile(fromC(context.fileName, context.fileNameSize), memory.frame);
     // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0057_challenge_cycles.asm"), memory.frame);
     // String asmContent   = platformApi.readFile(fromC(DATA_PATH"ASM/listing_0057_challenge_cycles.asm"), memory.frame);
     Tokenizer tokenizer = tokenize(asmContent);
@@ -1112,13 +1139,19 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
     u32 estimation              = 0;
     Registers registers         = {};
     u8 simulationMemory[U16Max] = {};
-    CPUStyle cpu                = CPUStyle_8088;
+    CPUStyle cpu                = context.cpu;
 
     LabelQueueItem labelQueue[64];
     u32 queueCount = 0;
 
+    String      ins;
+    ins.size    = (u32)kilobytes(512);
+    ins.content = PushArray(memory.frame, u8, ins.size);
+    OutputBuffer instructionAsString = makeOutputBuffer(ins);
+
     while(tokenizer.keepParsing)
     {
+        u8* oldCurrent = current;
         Token op = getToken(tokenizer);
         switch(op.type)
         {
@@ -1718,7 +1751,25 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
             }
             InvalidDefaultCase
         } 
+    
+        // @Note output instructions as String
+        if(oldCurrent != current)
+        {
+            while(oldCurrent != current)
+            {
+                u8 val = *oldCurrent;
+                for(s32 i = 7; i >= 0; --i)
+                {
+                    formatStringAdvance(instructionAsString, "%c", (val & (1 << i)) ? '1' : '0');
+                }
+                formatStringAdvance(instructionAsString, " ");
+                ++oldCurrent;
+            }
+            formatStringAdvance(instructionAsString, "\r\n");
+        }
     }
+
+    ins.size = (u32)instructionAsString.offset;
 
     for(u32 j = 0; j < queueCount; ++j)
     {
@@ -2841,6 +2892,8 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
         #endif
     }
 
+    SortZone sort = pushSortZone(group);
+
     globalVariable r32 t;
     // t += dt;
     M4x4 r = zRotation(t);
@@ -2848,60 +2901,128 @@ internal void computerEnhanceUpdate(GameRenderCommand& commands, GameAssets& ass
     Vector3 xAxis = r * v3(1, 0, 0);
     Vector3 yAxis = r * v3(0, 1, 0);
 
-    FontInstance font = pushFont(group, Font_PressStart2P, 40);
+    FontInstance font       = pushFont(group, Font_PressStart2P, 40);
+    FontInstance headerFont = pushFont(group, Font_FiraMono, 64);
+    r32 maxTextWidth = 1500.f;
+
+    pushCenteredShadowedTextAtConstrained(group, headerFont, fromC("ASM Source"), makeRect(topLeft(getWholeScreenInPixels(group))+ v2(30.f, -200.f),  v2(maxTextWidth, 200.f)), 20.f);
+
+    r32 rectRadius = 20.f;
     TextShapeAllocated shape = textOperation(TextOp_DrawText, 
                                          *font.font,
                                           group,
                                           asmContent.content,
                                           asmContent.size,
-                                          toV3(topLeft(getWholeScreenInPixels(group)), 0.f),
+                                          toV3(topLeft(getWholeScreenInPixels(group)), 0.f) + v3(30.f, -200.f, 0.f),
                                           memory.frame,
                                           RGBA_PACK(1, 1, 1, 1),
                                           font.pixelHeight,
-                                          1.f,
+                                          context.textScale,
                                           xAxis,
                                           yAxis,
                                          v3(0),
                                          RGBA_PACK_V(Color_black));
+    pushRectangle(group, addRadius(shape.text, rectRadius), -1.f, lerp(setAlpha(Color_darkGrey, 0.75f), setAlpha(Color_white, 0.75f), context.lerpRatio));
+    
 
-    Vector3 registersPosition = v3(1000, -500, 0);
+    r32 textWidth = rectWidth(shape.text);
+    if(textWidth > maxTextWidth)
+    {
+        context.textScale = (maxTextWidth - 1) / textWidth;
+    }
+            
+    Vector3 registersPosition = toV3(topLeft(getWholeScreenInPixels(group)), 0.f) + v3(3000, -300, 0);
     char tmp[64];
     u32 s = formatString(tmp, ArrayCount(tmp), "Cycles for %S : %d", getNameOf(CPUStyle, cpu), estimation);
     pushTextAt(group, font,  fromC(tmp, s), registersPosition, finalizeColor(Color_white));
 
     s = formatString(tmp, ArrayCount(tmp), "AX : %d", registers.registers[0]);
-    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,100,0), finalizeColor(Color_white));
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,100,0), finalizeColor(Color_white));
     s = formatString(tmp, ArrayCount(tmp), "BX : %d", registers.registers[1]);
-    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,200,0), finalizeColor(Color_white));
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,200,0), finalizeColor(Color_white));
     s = formatString(tmp, ArrayCount(tmp), "CX : %d", registers.registers[2]);
-    pushTextAt(group, font,  fromC(tmp, s), registersPosition+  v3(0,300,0), finalizeColor(Color_white));
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,300,0), finalizeColor(Color_white));
     s = formatString(tmp, ArrayCount(tmp), "DX : %d", registers.registers[3]);
-    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,400,0), finalizeColor(Color_white));
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,400,0), finalizeColor(Color_white));
     s = formatString(tmp, ArrayCount(tmp), "SP : %d", registers.registers[4]);
-    pushTextAt(group, font,  fromC(tmp, s), registersPosition +v3(0,500,0), finalizeColor(Color_white));
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,500,0), finalizeColor(Color_white));
     s = formatString(tmp, ArrayCount(tmp), "BP : %d", registers.registers[5]);
-    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,600,0), finalizeColor(Color_white));
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,600,0), finalizeColor(Color_white));
     s = formatString(tmp, ArrayCount(tmp), "SI : %d", registers.registers[6]);
-    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,700,0), finalizeColor(Color_white));
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,700,0), finalizeColor(Color_white));
     s = formatString(tmp, ArrayCount(tmp), "DI : %d", registers.registers[7]);
-    pushTextAt(group, font,  fromC(tmp, s), registersPosition + v3(0,800,0), finalizeColor(Color_white));
-
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,800,0), finalizeColor(Color_white));
+    s = formatString(tmp, ArrayCount(tmp), "CarryFlag %d", (registers.flags & CF_FLAG) ? 1 : 0);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,900,0), (registers.flags & CF_FLAG) ? finalizeColor(Color_green) : finalizeColor(setAlpha(Color_grey, 0.8f)));
+    s = formatString(tmp, ArrayCount(tmp), "ParityFlag %d", (registers.flags & PF_FLAG) ? 1 : 0);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,1000,0), (registers.flags & PF_FLAG) ? finalizeColor(Color_green) : finalizeColor(setAlpha(Color_grey, 0.8f)));
+    s = formatString(tmp, ArrayCount(tmp), "SignFlag %d", (registers.flags & SF_FLAG) ? 1 : 0);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,1100,0), (registers.flags & SF_FLAG) ? finalizeColor(Color_green) : finalizeColor(setAlpha(Color_grey, 0.8f)));
+    s = formatString(tmp, ArrayCount(tmp), "OverflowFlag %d", (registers.flags & OF_FLAG) ? 1 : 0);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,1200,0), (registers.flags & OF_FLAG) ? finalizeColor(Color_green) : finalizeColor(setAlpha(Color_grey, 0.8f)));
+    s = formatString(tmp, ArrayCount(tmp), "ZeroFlag %d", (registers.flags & ZF_FLAG) ? 1 : 0);
+    pushTextAt(group, font,  fromC(tmp, s), registersPosition - v3(0,1300,0), (registers.flags & ZF_FLAG) ? finalizeColor(Color_green) : finalizeColor(setAlpha(Color_grey, 0.8f)));
+    
     TextShapeAllocated shape2 = textOperation(TextOp_DrawText, 
                                          *font.font,
                                           group,
                                           full.content,
                                           full.size,
-                                          toV3(topLeft(getWholeScreenInPixels(group)) + v2(1600.f, -600.f), 0.f),
+                                          toV3(topLeft(getWholeScreenInPixels(group)) + v2(2400.f, -200.f), 0.f),
                                           memory.frame,
-                                          RGBA_PACK(1, 0, 1, 1),
+                                          RGBA_PACK(0, 0, 0, 1),
                                           font.pixelHeight,
-                                          1.f,
+                                          context.textScale,
                                           xAxis,
                                           yAxis,
                                          v3(0),
                                          RGBA_PACK_V(Color_black));
+    pushRectangle(group, addRadius(shape2.text, rectRadius), -1.f, lerp(setAlpha(Color_grey, 0.75f), setAlpha(Color_white, 0.75f), context.lerpRatio));
+    pushCenteredShadowedTextAtConstrained(group, headerFont, fromC("ASM output"), makeRect(topLeft(getWholeScreenInPixels(group))+ v2(2400.f, -200.f), v2(rectWidth(shape2.text), 200.f)), 20.f);
     
+    TextShapeAllocated shape3 = textOperation(TextOp_DrawText, 
+                                         *font.font,
+                                          group,
+                                          ins.content,
+                                          ins.size,
+                                          toV3(topLeft(getWholeScreenInPixels(group)) + v2(1600.f, -200.f), 0.f),
+                                          memory.frame,
+                                          RGBA_PACK(0, 0, 0, 1),
+                                          font.pixelHeight,
+                                          context.textScale,
+                                          xAxis,
+                                          yAxis,
+                                         v3(0),
+                                         RGBA_PACK_V(Color_black));
+    pushRectangle(group, addRadius(shape3.text, rectRadius), -1.f, lerp(setAlpha(Color_grey, 0.75f), setAlpha(Color_white, 0.75f), context.lerpRatio));
+    pushCenteredShadowedTextAtConstrained(group, headerFont, fromC("Binary format"), makeRect(topLeft(getWholeScreenInPixels(group))+ v2(1600.f, -200.f), v2(rectWidth(shape3.text), 200.f)), 20.f);
 
+    ToggleLineStyle lineStyle = {};
+    lineStyle.lineColor = Color_grey * 0.9f;
+    lineStyle.hintColor = Color_white;
+    lineStyle.textColor = Color_darkGrey;
+    lineStyle.validatedColor = Color_darkGrey;
+    lineStyle.unvalidatedColor  = Color_lightGrey;
+    lineStyle.handleColor = Color_cyan;
+    Rect2 toggleZone = makeRect(topLeft(getWholeScreenInPixels(group)) + v2(3000, -200), v2(800, 200)); 
+
+    Vector2 pixelMouse = hadamard(inputs.clipSpaceMousePosition, v2(commands.settings.width, commands.settings.height) * 0.5f);
+    FocusZone focus = beginFocusZone(group, pixelMouse, pixelMouse, &ui.focus, &ui.interaction, &inputs, 0, dt);
+    OptionToggleLine line = toggleLine(focus, 
+                                       font, 
+                                       toggleZone, 
+                                       lineStyle, fromC("8086/8088"), context.cpu == CPUStyle_8086, context.toggleTime, dt, DEV_ID(0), 1.f);
+    if(line.state)
+    {
+        context.cpu = CPUStyle_8086;
+    }
+    else
+    {
+        context.cpu = CPUStyle_8088;
+    }
+
+    endSortZone(sort, memory.frame);
+                                
     // Image image  = {};
     // image.width  = 64;
     // image.height = 64;
